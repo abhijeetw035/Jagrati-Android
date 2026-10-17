@@ -1,0 +1,498 @@
+package com.hexagraph.jagrati_android.ui.screens.student
+
+import androidx.lifecycle.viewModelScope
+import com.hexagraph.jagrati_android.model.ResponseError
+import com.hexagraph.jagrati_android.model.dao.GroupsDao
+import com.hexagraph.jagrati_android.model.dao.StudentDao
+import com.hexagraph.jagrati_android.model.dao.VillageDao
+import com.hexagraph.jagrati_android.model.permission.AllPermissions
+import com.hexagraph.jagrati_android.model.student.StudentRequest
+import com.hexagraph.jagrati_android.model.student.StudentResponse
+import com.hexagraph.jagrati_android.model.student.UpdateStudentRequest
+import com.hexagraph.jagrati_android.model.student.toStudent
+import com.hexagraph.jagrati_android.repository.auth.StudentRepository
+import com.hexagraph.jagrati_android.ui.screens.main.BaseViewModel
+import com.hexagraph.jagrati_android.util.AppPreferences
+import com.hexagraph.jagrati_android.util.StudentRegistrationDraft
+import com.hexagraph.jagrati_android.util.Utils
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+
+data class StudentRegistrationUiState(
+    val isLoading: Boolean = false,
+    val isUpdateMode: Boolean = false,
+    val existingPid: String? = null,
+    val firstName: String = "",
+    val lastName: String = "",
+    val gender: String? = null,
+    val yearOfBirth: Int? = null,
+    val schoolClass: String = "",
+    val primaryContactNo: String = "",
+    val secondaryContactNo: String = "",
+    val fathersName: String = "",
+    val mothersName: String = "",
+    val villages: Map<Long, String> = emptyMap(),
+    val groups: Map<Long, String> = emptyMap(),
+    val selectedVillageId: Long? = null,
+    val selectedGroupId: Long? = null,
+    val formErrors: Map<String, String> = emptyMap(),
+    val submissionSuccessful: Boolean = false,
+    val canDeleteStudent: Boolean = false,
+    val draftLoaded: Boolean = false,
+    val error: ResponseError? = null,
+    val successMessage: String? = null
+)
+
+class StudentRegistrationViewModel(
+    private val studentRepository: StudentRepository,
+    private val studentDao: StudentDao,
+    private val villagesDao: VillageDao,
+    private val groupsDao: GroupsDao,
+    private val appPreferences: AppPreferences,
+    private val pidToUpdate: String?
+) : BaseViewModel<StudentRegistrationUiState>() {
+
+    private val _isLoading = MutableStateFlow(false)
+    private val _isUpdateMode = MutableStateFlow(pidToUpdate != null)
+    private val _existingPid = MutableStateFlow(pidToUpdate)
+
+    private val _firstName = MutableStateFlow("")
+    private val _lastName = MutableStateFlow("")
+    private val _gender = MutableStateFlow<String?>(null)
+    private val _yearOfBirth = MutableStateFlow<Int?>(null)
+    private val _schoolClass = MutableStateFlow("")
+    private val _primaryContactNo = MutableStateFlow("")
+    private val _secondaryContactNo = MutableStateFlow("")
+    private val _fathersName = MutableStateFlow("")
+    private val _mothersName = MutableStateFlow("")
+
+    private val _villages = MutableStateFlow<Map<Long, String>>(emptyMap())
+    private val _groups = MutableStateFlow<Map<Long, String>>(emptyMap())
+    private val _selectedVillageId = MutableStateFlow<Long?>(null)
+    private val _selectedGroupId = MutableStateFlow<Long?>(null)
+
+    private val _formErrors = MutableStateFlow<Map<String, String>>(emptyMap())
+    private val _submissionSuccessful = MutableStateFlow(false)
+    private val _canDeleteStudent = MutableStateFlow(false)
+    private val _draftLoaded = MutableStateFlow(false)
+
+    override val uiState: StateFlow<StudentRegistrationUiState> = createUiStateFlow()
+    var pid: String? = pidToUpdate
+
+    init {
+        viewModelScope.launch(Dispatchers.IO) {
+            launch {
+                villagesDao.getAllActiveVillages().collect { villages ->
+                    _villages.update { villages.associate { Pair(it.id, it.name) } }
+                }
+            }
+            launch {
+                groupsDao.getAllActiveGroups().collect { groups ->
+                    _groups.update { groups.associate { Pair(it.id, it.name) } }
+                }
+            }
+            launch {
+                appPreferences.hasPermission(AllPermissions.STUDENT_DELETE).collect { hasPermission ->
+                    _canDeleteStudent.update { hasPermission && _isUpdateMode.value }
+                }
+            }
+            if (pidToUpdate != null) {
+                loadExistingStudentData(pidToUpdate)
+            } else {
+                // Load draft for new registration
+                loadDraftIfExists()
+            }
+
+            // Observe form changes and save as draft (only for new registrations)
+            if (pidToUpdate == null) {
+                launch {
+                    combine(
+                        _firstName, _lastName, _gender, _yearOfBirth,
+                        _schoolClass, _primaryContactNo, _secondaryContactNo,
+                        _fathersName, _mothersName, _selectedVillageId, _selectedGroupId
+                    ) { values -> values }
+                        .collect {
+                            saveDraft()
+                        }
+                }
+            }
+        }
+    }
+
+    override fun createUiStateFlow(): StateFlow<StudentRegistrationUiState> {
+        return combine(
+            _isLoading,
+            _isUpdateMode,
+            _existingPid,
+            _firstName,
+            _lastName,
+            _gender,
+            _yearOfBirth,
+            _schoolClass,
+            _primaryContactNo,
+            _secondaryContactNo,
+            _fathersName,
+            _mothersName,
+            _villages,
+            _groups,
+            _selectedVillageId,
+            _selectedGroupId,
+            _formErrors,
+            _submissionSuccessful,
+            _canDeleteStudent,
+            _draftLoaded,
+            errorFlow,
+            successMsgFlow
+        ) { flows ->
+            StudentRegistrationUiState(
+                isLoading = flows[0] as Boolean,
+                isUpdateMode = flows[1] as Boolean,
+                existingPid = flows[2] as String?,
+                firstName = flows[3] as String,
+                lastName = flows[4] as String,
+                gender = flows[5] as String?,
+                yearOfBirth = flows[6] as Int?,
+                schoolClass = flows[7] as String,
+                primaryContactNo = flows[8] as String,
+                secondaryContactNo = flows[9] as String,
+                fathersName = flows[10] as String,
+                mothersName = flows[11] as String,
+                villages = flows[12] as Map<Long, String>,
+                groups = flows[13] as Map<Long, String>,
+                selectedVillageId = flows[14] as Long?,
+                selectedGroupId = flows[15] as Long?,
+                formErrors = flows[16] as Map<String, String>,
+                submissionSuccessful = flows[17] as Boolean,
+                canDeleteStudent = flows[18] as Boolean,
+                draftLoaded = flows[19] as Boolean,
+                error = flows[20] as ResponseError?,
+                successMessage = flows[21] as String?
+            )
+        }.stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000),
+            initialValue = StudentRegistrationUiState()
+        )
+    }
+
+    private suspend fun loadDraftIfExists() {
+        try {
+            val draft = appPreferences.getStudentRegistrationDraft()
+            draft?.let {
+                _firstName.update { draft.firstName }
+                _lastName.update { draft.lastName }
+                _gender.update { draft.gender }
+                _yearOfBirth.update { draft.yearOfBirth }
+                _schoolClass.update { draft.schoolClass }
+                _primaryContactNo.update { draft.primaryContactNo }
+                _secondaryContactNo.update { draft.secondaryContactNo }
+                _fathersName.update { draft.fathersName }
+                _mothersName.update { draft.mothersName }
+                _selectedVillageId.update { draft.selectedVillageId }
+                _selectedGroupId.update { draft.selectedGroupId }
+                _draftLoaded.update { true }
+            }
+        } catch (e: Exception) {
+            // Ignore draft loading errors
+        }
+    }
+
+    private suspend fun saveDraft() {
+        try {
+            val draft = StudentRegistrationDraft(
+                firstName = _firstName.value,
+                lastName = _lastName.value,
+                gender = _gender.value,
+                yearOfBirth = _yearOfBirth.value,
+                schoolClass = _schoolClass.value,
+                primaryContactNo = _primaryContactNo.value,
+                secondaryContactNo = _secondaryContactNo.value,
+                fathersName = _fathersName.value,
+                mothersName = _mothersName.value,
+                selectedVillageId = _selectedVillageId.value,
+                selectedGroupId = _selectedGroupId.value
+            )
+            appPreferences.saveStudentRegistrationDraft(draft)
+        } catch (e: Exception) {
+            // Ignore draft saving errors
+        }
+    }
+
+    private suspend fun clearDraft() {
+        try {
+            appPreferences.clearStudentRegistrationDraft()
+        } catch (e: Exception) {
+            // Ignore draft clearing errors
+        }
+    }
+
+    private suspend fun loadExistingStudentData(pid: String) {
+        _isLoading.update { true }
+        try {
+            studentRepository.getStudentByPid(pid).collect { resource ->
+                when {
+                    resource.isSuccess -> {
+                        resource.data?.let { student ->
+                            populateFormWithStudentData(student)
+                        }
+                        _isLoading.update { false }
+                    }
+                    resource.isFailed -> {
+                        emitError(resource.error)
+                        _isLoading.update { false }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            emitError(ResponseError.UNKNOWN)
+            _isLoading.update { false }
+        }
+    }
+
+    private fun populateFormWithStudentData(student: StudentResponse) {
+        _firstName.update { student.firstName }
+        _lastName.update { student.lastName }
+        _gender.update { student.gender }
+        _yearOfBirth.update { student.yearOfBirth }
+        _schoolClass.update { student.schoolClass ?: "" }
+        _primaryContactNo.update { student.primaryContactNo ?: "" }
+        _secondaryContactNo.update { student.secondaryContactNo ?: "" }
+        _fathersName.update { student.fathersName ?: "" }
+        _mothersName.update { student.mothersName ?: "" }
+        _selectedVillageId.update { student.villageId }
+        _selectedGroupId.update { student.groupId }
+    }
+
+    fun updateFirstName(value: String) {
+        _firstName.update { value }
+        clearFieldError("firstName")
+    }
+
+    fun updateLastName(value: String) {
+        _lastName.update { value }
+        clearFieldError("lastName")
+    }
+
+    fun updateGender(value: String) {
+        _gender.update { value }
+        clearFieldError("gender")
+    }
+
+    fun updateYearOfBirth(value: Int?) {
+        _yearOfBirth.update { value }
+        clearFieldError("yearOfBirth")
+    }
+
+    fun updateSchoolClass(value: String) {
+        _schoolClass.update { value }
+        clearFieldError("schoolClass")
+    }
+
+    fun updatePrimaryContactNo(value: String) {
+        _primaryContactNo.update { value }
+        clearFieldError("primaryContactNo")
+    }
+
+    fun updateSecondaryContactNo(value: String) {
+        _secondaryContactNo.update { value }
+        clearFieldError("secondaryContactNo")
+    }
+
+    fun updateFathersName(value: String) {
+        _fathersName.update { value }
+        clearFieldError("fathersName")
+    }
+
+    fun updateMothersName(value: String) {
+        _mothersName.update { value }
+        clearFieldError("mothersName")
+    }
+
+    fun updateSelectedVillageId(villageId: Long) {
+        _selectedVillageId.update { villageId }
+        clearFieldError("village")
+    }
+
+    fun updateSelectedGroupId(groupId: Long) {
+        _selectedGroupId.update { groupId }
+        clearFieldError("group")
+    }
+
+    private fun clearFieldError(field: String) {
+        _formErrors.update { currentErrors ->
+            currentErrors.toMutableMap().apply { remove(field) }
+        }
+    }
+
+    fun submitStudent() {
+        if (!validateForm()) {
+            return
+        }
+
+        viewModelScope.launch(Dispatchers.IO) {
+            _isLoading.update { true }
+
+            try {
+                if (_isUpdateMode.value && _existingPid.value != null) {
+                    updateExistingStudent()
+                } else {
+                    registerNewStudent()
+                }
+            } catch (e: Exception) {
+                emitError(ResponseError.UNKNOWN)
+                _isLoading.update { false }
+            }
+        }
+    }
+
+    private suspend fun registerNewStudent() {
+        val pid = Utils.generatePid()
+        this.pid = pid
+
+        val request = StudentRequest(
+            pid = pid,
+            firstName = _firstName.value.trim(),
+            lastName = _lastName.value.trim(),
+            yearOfBirth = _yearOfBirth.value,
+            gender = _gender.value!!,
+            schoolClass = _schoolClass.value.trim().takeIf { it.isNotEmpty() },
+            villageId = _selectedVillageId.value!!,
+            groupId = _selectedGroupId.value!!,
+            primaryContactNo = _primaryContactNo.value.trim().takeIf { it.isNotEmpty() },
+            secondaryContactNo = _secondaryContactNo.value.trim().takeIf { it.isNotEmpty() },
+            fathersName = _fathersName.value.trim().takeIf { it.isNotEmpty() },
+            mothersName = _mothersName.value.trim().takeIf { it.isNotEmpty() }
+        )
+
+        studentRepository.registerStudent(request).collect { resource ->
+            when {
+                resource.isSuccess -> {
+                    emitMsg("Student registered successfully!")
+                    // Addiong to DAO after registration
+                    studentDao.upsertStudentDetails(
+                        request.toStudent()
+                    )
+                    // Clear draft on successful registration
+                    clearDraft()
+                    _submissionSuccessful.update { true }
+                    _isLoading.update { false }
+                }
+                resource.isFailed -> {
+                    emitError(resource.error)
+                    _isLoading.update { false }
+                }
+            }
+        }
+    }
+
+    private suspend fun updateExistingStudent() {
+        val request = UpdateStudentRequest(
+            pid = _existingPid.value!!,
+            firstName = _firstName.value.trim(),
+            lastName = _lastName.value.trim(),
+            yearOfBirth = _yearOfBirth.value,
+            gender = _gender.value,
+            schoolClass = _schoolClass.value.trim().takeIf { it.isNotEmpty() },
+            villageId = _selectedVillageId.value,
+            groupId = _selectedGroupId.value,
+            primaryContactNo = _primaryContactNo.value.trim().takeIf { it.isNotEmpty() },
+            secondaryContactNo = _secondaryContactNo.value.trim().takeIf { it.isNotEmpty() },
+            fathersName = _fathersName.value.trim().takeIf { it.isNotEmpty() },
+            mothersName = _mothersName.value.trim().takeIf { it.isNotEmpty() }
+        )
+
+        studentRepository.updateStudent(request).collect { resource ->
+            when {
+                resource.isSuccess -> {
+                    emitMsg("Student details updated successfully!")
+                    _submissionSuccessful.update { true }
+                    _isLoading.update { false }
+                }
+                resource.isFailed -> {
+                    emitError(resource.error)
+                    _isLoading.update { false }
+                }
+            }
+        }
+    }
+
+    private fun validateForm(): Boolean {
+        val errors = mutableMapOf<String, String>()
+
+        if (_firstName.value.trim().isEmpty()) {
+            errors["firstName"] = "First name is required"
+        }
+
+        if (_lastName.value.trim().isEmpty()) {
+            errors["lastName"] = "Last name is required"
+        }
+
+        if (_gender.value == null) {
+            errors["gender"] = "Gender is required"
+        }
+
+        if (_selectedVillageId.value == null) {
+            errors["village"] = "Village is required"
+        }
+
+        if (_selectedGroupId.value == null) {
+            errors["group"] = "Group is required"
+        }
+
+        if (_primaryContactNo.value.trim().isNotEmpty() && _primaryContactNo.value.trim().length != 10) {
+            errors["primaryContactNo"] = "Contact number must be 10 digits"
+        }
+
+        if (_secondaryContactNo.value.trim().isNotEmpty() && _secondaryContactNo.value.trim().length != 10) {
+            errors["secondaryContactNo"] = "Contact number must be 10 digits"
+        }
+
+        _formErrors.update { errors }
+        return errors.isEmpty()
+    }
+
+    fun resetSubmissionStatus() {
+        _submissionSuccessful.update { false }
+    }
+
+    fun deleteStudent(onSuccess: ()-> Unit) {
+        val pidToDelete = _existingPid.value
+        if (pidToDelete == null) {
+            emitError(ResponseError.UNKNOWN)
+            return
+        }
+
+        viewModelScope.launch(Dispatchers.IO) {
+            _isLoading.update { true }
+            try {
+                studentRepository.deleteStudent(pidToDelete).collect { resource ->
+                    when {
+                        resource.isSuccess -> {
+                            emitMsg("Student deleted successfully!")
+                            // No need to delete from local database
+                            onSuccess()
+                            _isLoading.update { false }
+                        }
+                        resource.isFailed -> {
+                            emitError(resource.error)
+                            _isLoading.update { false }
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                emitError(ResponseError.UNKNOWN)
+                _isLoading.update { false }
+            }
+        }
+    }
+
+    fun clearDraftLoadedFlag() {
+        _draftLoaded.update { false }
+    }
+}
